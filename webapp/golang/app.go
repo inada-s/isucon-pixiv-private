@@ -2,7 +2,9 @@ package main
 
 import (
 	crand "crypto/rand"
+	"crypto/sha512"
 	"encoding/hex"
+	"flag"
 	"fmt"
 	"html/template"
 	"io"
@@ -16,10 +18,11 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/bradfitz/gomemcache/memcache"
-	gsm "github.com/bradleypeabody/gorilla-sessions-memcache"
+	_ "net/http/pprof"
+
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gorilla/sessions"
 	"github.com/jmoiron/sqlx"
@@ -29,7 +32,8 @@ import (
 
 var (
 	db    *sqlx.DB
-	store *gsm.MemcacheStore
+	store *sessions.CookieStore
+	fnc   = flag.String("func", "default", "")
 )
 
 const (
@@ -54,6 +58,7 @@ type User struct {
 type Post struct {
 	ID           int       `db:"id"`
 	UserID       int       `db:"user_id"`
+	AccountName  string    `db:"account_name"`
 	Imgdata      []byte    `db:"imgdata"`
 	Body         string    `db:"body"`
 	Mime         string    `db:"mime"`
@@ -65,17 +70,17 @@ type Post struct {
 }
 
 type Comment struct {
-	ID        int       `db:"id"`
-	PostID    int       `db:"post_id"`
-	UserID    int       `db:"user_id"`
-	Comment   string    `db:"comment"`
-	CreatedAt time.Time `db:"created_at"`
-	User      User
+	ID          int       `db:"id"`
+	PostID      int       `db:"post_id"`
+	UserID      int       `db:"user_id"`
+	AccountName string    `db:"account_name"`
+	Comment     string    `db:"comment"`
+	CreatedAt   time.Time `db:"created_at"`
+	User        User
 }
 
 func init() {
-	memcacheClient := memcache.New("localhost:11211")
-	store = gsm.NewMemcacheStore(memcacheClient, "isucogram_", []byte("sendagaya"))
+	store = sessions.NewCookieStore([]byte("sendagaya"))
 }
 
 func imageInitialize() {
@@ -167,13 +172,11 @@ func tryLogin(accountName, password string) *User {
 	}
 }
 
-func validateUser(accountName, password string) bool {
-	if !(regexp.MustCompile("\\A[0-9a-zA-Z_]{3,}\\z").MatchString(accountName) &&
-		regexp.MustCompile("\\A[0-9a-zA-Z_]{6,}\\z").MatchString(password)) {
-		return false
-	}
+var regexpName = regexp.MustCompile("\\A[0-9a-zA-Z_]{3,}\\z")
+var regexpPass = regexp.MustCompile("\\A[0-9a-zA-Z_]{6,}\\z")
 
-	return true
+func validateUser(accountName, password string) bool {
+	return regexpName.MatchString(accountName) && regexpPass.MatchString(password)
 }
 
 // 今回のGo実装では言語側のエスケープの仕組みが使えないのでOSコマンドインジェクション対策できない
@@ -183,7 +186,7 @@ func escapeshellarg(arg string) string {
 	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
 }
 
-func digest(src string) string {
+func digestOld(src string) string {
 	// opensslのバージョンによっては (stdin)= というのがつくので取る
 	out, err := exec.Command("/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
 	if err != nil {
@@ -192,6 +195,12 @@ func digest(src string) string {
 	}
 
 	return strings.TrimSuffix(string(out), "\n")
+}
+
+func digest(src string) string {
+	s := sha512.New()
+	io.WriteString(s, src)
+	return hex.EncodeToString(s.Sum(nil))
 }
 
 func calculateSalt(accountName string) string {
@@ -238,6 +247,39 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
+func makePosts2(results []Post, CSRFToken string, allComments bool) ([]Post, error) {
+	var posts []Post
+
+	for _, p := range results {
+		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` ASC"
+
+		var comments []Comment
+		cerr := db.Select(&comments, query, p.ID)
+		if cerr != nil {
+			return nil, cerr
+		}
+
+		p.CommentCount = len(comments)
+
+		for i := 0; i < len(comments); i++ {
+			comments[i].User.AccountName = comments[i].AccountName
+		}
+
+		p.Comments = comments
+		/*
+			perr := db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+			if perr != nil {
+				return nil, perr
+			}
+		*/
+		p.CSRFToken = CSRFToken
+
+		posts = append(posts, p)
+	}
+
+	return posts, nil
+}
+
 func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, error) {
 	var posts []Post
 
@@ -251,6 +293,7 @@ func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, erro
 		if !allComments {
 			query += " LIMIT 3"
 		}
+
 		var comments []Comment
 		cerr := db.Select(&comments, query, p.ID)
 		if cerr != nil {
@@ -270,12 +313,12 @@ func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, erro
 		}
 
 		p.Comments = comments
-
-		perr := db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if perr != nil {
-			return nil, perr
-		}
-
+		/*
+			perr := db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
+			if perr != nil {
+				return nil, perr
+			}
+		*/
 		p.CSRFToken = CSRFToken
 
 		if p.User.DelFlg == 0 {
@@ -331,6 +374,7 @@ func getInitialize(w http.ResponseWriter, r *http.Request) {
 	dbInitialize()
 	imageInitialize()
 	memInitialize()
+	updateIndexPosts()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -461,39 +505,34 @@ var IndexTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseF
 	getTemplPath("posts.html"),
 	getTemplPath("post.html")))
 
+var getIndexPostsMtx sync.RWMutex
+var getIndexPosts []Post
+
+func updateIndexPosts() bool {
+	getIndexPostsMtx.Lock()
+	defer getIndexPostsMtx.Unlock()
+	getIndexPosts = []Post{}
+	err := db.Select(&getIndexPosts, "SELECT posts.id, posts.user_id, posts.body, posts.mime, posts.created_at, posts.account_name FROM `posts` AS posts INNER JOIN `users` ON user_id = users.id WHERE users.del_flg = 0 ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
+	if err != nil {
+		fmt.Println(err)
+		return false
+	}
+	return true
+}
+
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
-	results := []Post{}
+	getIndexPostsMtx.RLock()
+	results := getIndexPosts
+	getIndexPostsMtx.RUnlock()
 
-	err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` ORDER BY `created_at` DESC")
-	if err != nil {
-		fmt.Println(err)
-		return
-	}
-
-	posts, merr := makePosts(results, getCSRFToken(r), false)
+	posts, merr := makePosts2(results, getCSRFToken(r), false)
 	if merr != nil {
 		fmt.Println(merr)
 		return
 	}
 
-	/*
-		fmap := template.FuncMap{
-			"imageURL": imageURL,
-		}
-			template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-				getTemplPath("layout.html"),
-				getTemplPath("index.html"),
-				getTemplPath("posts.html"),
-				getTemplPath("post.html"),
-			)).Execute(w, struct {
-				Posts     []Post
-				Me        User
-				CSRFToken string
-				Flash     string
-			}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
-	*/
 	IndexTemplate.Execute(w, struct {
 		Posts     []Post
 		Me        User
@@ -524,13 +563,13 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	rerr := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC", user.ID)
+	rerr := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `user_id` = ? ORDER BY `created_at` DESC LIMIT ?", user.ID, postsPerPage)
 	if rerr != nil {
 		fmt.Println(rerr)
 		return
 	}
 
-	posts, merr := makePosts(results, getCSRFToken(r), false)
+	posts, merr := makePosts2(results, getCSRFToken(r), false)
 	if merr != nil {
 		fmt.Println(merr)
 		return
@@ -595,25 +634,36 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		fmt.Println(parseErr)
 		return
 	}
+
 	maxCreatedAt := m.Get("max_created_at")
 	if maxCreatedAt == "" {
 		return
 	}
 
-	t, terr := time.Parse(ISO8601_FORMAT, maxCreatedAt)
-	if terr != nil {
-		fmt.Println(terr)
+	//t, terr := time.Parse(ISO8601_FORMAT, maxCreatedAt)
+	//if terr != nil {
+	//	fmt.Println(terr)
+	//	return
+	//}
+	/*
+		results := []Post{}
+		rerr := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at`, `account_name` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601_FORMAT))
+		if rerr != nil {
+			fmt.Println(rerr)
+			return
+		}
+	*/
+
+	getIndexPostsMtx.RLock()
+	results := getIndexPosts
+	getIndexPostsMtx.RUnlock()
+
+	if len(results) == 0 {
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	results := []Post{}
-	rerr := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts` WHERE `created_at` <= ? ORDER BY `created_at` DESC", t.Format(ISO8601_FORMAT))
-	if rerr != nil {
-		fmt.Println(rerr)
-		return
-	}
-
-	posts, merr := makePosts(results, getCSRFToken(r), false)
+	posts, merr := makePosts2(results, getCSRFToken(r), false)
 	if merr != nil {
 		fmt.Println(merr)
 		return
@@ -668,6 +718,8 @@ func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
+	r.ParseMultipartForm(1024)
+
 	me := getSessionUser(r)
 	if !isLogin(me) {
 		http.Redirect(w, r, "/login", http.StatusFound)
@@ -728,8 +780,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	//query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
-	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
+	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`, `account_name`) VALUES (?,?,?,?,?)"
 	result, eerr := db.Exec(
 		query,
 		me.ID,
@@ -737,6 +788,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		//filedata,
 		[]byte{},
 		r.FormValue("body"),
+		me.AccountName,
 	)
 	if eerr != nil {
 		fmt.Println(eerr.Error())
@@ -759,38 +811,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error saving file: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-
+	go updateIndexPosts()
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 	return
-}
-
-func getImage(c web.C, w http.ResponseWriter, r *http.Request) {
-	pidStr := c.URLParams["id"]
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
-	post := Post{}
-	derr := db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
-	if derr != nil {
-		fmt.Println(derr.Error())
-		return
-	}
-	ext := c.URLParams["ext"]
-
-	if ext == "jpg" && post.Mime == "image/jpeg" ||
-		ext == "png" && post.Mime == "image/png" ||
-		ext == "gif" && post.Mime == "image/gif" {
-		w.Header().Set("Content-Type", post.Mime)
-		_, err := w.Write(post.Imgdata)
-		if err != nil {
-			fmt.Println(err.Error())
-		}
-		return
-	}
-
-	w.WriteHeader(http.StatusNotFound)
 }
 
 func postComment(w http.ResponseWriter, r *http.Request) {
@@ -811,8 +834,8 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`) VALUES (?,?,?)"
-	db.Exec(query, postID, me.ID, r.FormValue("comment"))
+	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`, `account_name`) VALUES (?,?,?,?)"
+	db.Exec(query, postID, me.ID, r.FormValue("comment"), me.AccountName)
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
@@ -874,6 +897,7 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	flag.Parse()
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
 		host = "localhost"
@@ -910,6 +934,17 @@ func main() {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
 	defer db.Close()
+
+	if *fnc != "default" {
+		var users []User
+		err = db.Select(&users, "SELECT id, account_name FROM users")
+		fmt.Println(err)
+		for _, user := range users {
+			//db.Exec("UPDATE `comments` SET `account_name` = ? WHERE `user_id` = ?", user.AccountName, user.ID)
+			db.Exec("UPDATE `posts` SET `account_name` = ? WHERE `user_id` = ?", user.AccountName, user.ID)
+		}
+		return
+	}
 
 	goji.Get("/initialize", getInitialize)
 	goji.Get("/login", getLogin)
