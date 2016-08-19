@@ -3,3 +3,6 @@ all:
 
 setup:
 	go get -u .
+
+restart:
+	sudo systemctl restart isu-go	

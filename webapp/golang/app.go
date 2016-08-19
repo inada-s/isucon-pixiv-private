@@ -39,6 +39,7 @@ const (
 
 	// CSRF Token error
 	StatusUnprocessableEntity = 422
+	imagePath                 = "/home/isucon/work/webapp/image"
 )
 
 type User struct {
@@ -75,6 +76,65 @@ type Comment struct {
 func init() {
 	memcacheClient := memcache.New("localhost:11211")
 	store = gsm.NewMemcacheStore(memcacheClient, "isucogram_", []byte("sendagaya"))
+}
+
+func imageInitialize() {
+	os.MkdirAll(imagePath, 0777)
+
+	files, err := ioutil.ReadDir(imagePath + "/")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	for _, file := range files {
+		var id int
+		var ext string
+		fmt.Sscanf(file.Name(), "%d.%s", &id, &ext)
+		if id > 10000 {
+			os.Remove(file.Name())
+		}
+	}
+
+	/*
+		for id := 0; id <= 10000; id += 50 {
+			var posts []Post
+			err := db.Select(&posts, "SELECT * FROM `posts` WHERE id > ? AND id <= ?", id, id+50)
+			if err != nil {
+				fmt.Println(err.Error())
+				return
+			}
+			for _, post := range posts {
+				ext := ""
+				if post.Mime == "image/jpeg" {
+					ext = "jpg"
+				} else if post.Mime == "image/png" {
+					ext = "png"
+				} else if post.Mime == "image/gif" {
+					ext = "gif"
+				}
+				path := imagePath + "/" + fmt.Sprint(post.ID) + "." + ext
+				if _, err := os.Stat(path); os.IsNotExist(err) {
+					err = ioutil.WriteFile(path, post.Imgdata, 0777)
+					if err != nil {
+						fmt.Println("Image WriteError", err)
+						return
+					}
+				}
+			}
+		}
+	*/
+}
+
+func memInitialize() {
+	/*
+		PostDB = make([]int, 0, 20000)
+
+		var results []Post
+		err := db.Select(&results, "SELECT `id`, `user_id`, `body`, `mime`, `created_at` FROM `posts`")
+		mtxPostDB.Lock()
+		PostDB = append(PostDB, results...)
+		mtxPostDB.Unlock()
+	*/
 }
 
 func dbInitialize() {
@@ -269,8 +329,14 @@ func getTemplPath(filename string) string {
 
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	dbInitialize()
+	imageInitialize()
+	memInitialize()
 	w.WriteHeader(http.StatusOK)
 }
+
+var loginTemplate = template.Must(template.ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("login.html")))
 
 func getLogin(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
@@ -280,10 +346,7 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("login.html")),
-	).Execute(w, struct {
+	loginTemplate.Execute(w, struct {
 		Me    User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
@@ -388,6 +451,16 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
+var fmap = template.FuncMap{
+	"imageURL": imageURL,
+}
+
+var IndexTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("index.html"),
+	getTemplPath("posts.html"),
+	getTemplPath("post.html")))
+
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
@@ -405,22 +478,35 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	/*
+		fmap := template.FuncMap{
+			"imageURL": imageURL,
+		}
+			template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+				getTemplPath("layout.html"),
+				getTemplPath("index.html"),
+				getTemplPath("posts.html"),
+				getTemplPath("post.html"),
+			)).Execute(w, struct {
+				Posts     []Post
+				Me        User
+				CSRFToken string
+				Flash     string
+			}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	*/
+	IndexTemplate.Execute(w, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
 		Flash     string
 	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
 }
+
+var accountNameTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("user.html"),
+	getTemplPath("posts.html"),
+	getTemplPath("post.html")))
 
 func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 	user := User{}
@@ -488,16 +574,7 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("user.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	accountNameTemplate.Execute(w, struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -506,6 +583,10 @@ func getAccountName(c web.C, w http.ResponseWriter, r *http.Request) {
 		Me             User
 	}{posts, user, postCount, commentCount, commentedCount, me})
 }
+
+var getPostsTemplate = template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
+	getTemplPath("posts.html"),
+	getTemplPath("post.html")))
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
 	m, parseErr := url.ParseQuery(r.URL.RawQuery)
@@ -543,15 +624,13 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, posts)
+	getPostsTemplate.Execute(w, posts)
 }
+
+var getPostsIDTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
+	getTemplPath("layout.html"),
+	getTemplPath("post_id.html"),
+	getTemplPath("post.html")))
 
 func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 	pid, err := strconv.Atoi(c.URLParams["id"])
@@ -582,15 +661,7 @@ func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("post_id.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	getPostsIDTemplate.Execute(w, struct {
 		Post Post
 		Me   User
 	}{p, me})
@@ -619,15 +690,19 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mime := ""
+	ext := ""
 	if file != nil {
 		// 投稿のContent-Typeからファイルのタイプを決定する
 		contentType := header.Header["Content-Type"][0]
 		if strings.Contains(contentType, "jpeg") {
 			mime = "image/jpeg"
+			ext = "jpg"
 		} else if strings.Contains(contentType, "png") {
 			mime = "image/png"
+			ext = "png"
 		} else if strings.Contains(contentType, "gif") {
 			mime = "image/gif"
+			ext = "gif"
 		} else {
 			session := getSession(r)
 			session.Values["notice"] = "投稿できる画像形式はjpgとpngとgifだけです"
@@ -637,13 +712,14 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
-	filedata, rerr := ioutil.ReadAll(file)
-	if rerr != nil {
-		fmt.Println(rerr.Error())
-	}
-
-	if len(filedata) > UploadLimit {
+	/*
+		filedata, rerr := ioutil.ReadAll(file)
+		if rerr != nil {
+			fmt.Println(rerr.Error())
+		}
+	*/
+	//if len(filedata) > UploadLimit {
+	if r.ContentLength > UploadLimit {
 		session := getSession(r)
 		session.Values["notice"] = "ファイルサイズが大きすぎます"
 		session.Save(r, w)
@@ -652,12 +728,14 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	//query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, eerr := db.Exec(
 		query,
 		me.ID,
 		mime,
-		filedata,
+		//filedata,
+		[]byte{},
 		r.FormValue("body"),
 	)
 	if eerr != nil {
@@ -668,6 +746,17 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 	pid, lerr := result.LastInsertId()
 	if lerr != nil {
 		fmt.Println(lerr.Error())
+		return
+	}
+
+	outfile, err := os.Create(imagePath + "/" + fmt.Sprint(pid) + "." + ext)
+	if err != nil {
+		fmt.Println(err.Error())
+		return
+	}
+	_, err = io.Copy(outfile, file)
+	if err != nil {
+		http.Error(w, "Error saving file: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -682,14 +771,12 @@ func getImage(c web.C, w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
-
 	post := Post{}
 	derr := db.Get(&post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
 	if derr != nil {
 		fmt.Println(derr.Error())
 		return
 	}
-
 	ext := c.URLParams["ext"]
 
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
@@ -835,10 +922,10 @@ func main() {
 	goji.Get("/posts", getPosts)
 	goji.Get("/posts/:id", getPostsID)
 	goji.Post("/", postIndex)
-	goji.Get("/image/:id.:ext", getImage)
+	//goji.Get("/image/:id.:ext", getImage)
 	goji.Post("/comment", postComment)
 	goji.Get("/admin/banned", getAdminBanned)
 	goji.Post("/admin/banned", postAdminBanned)
-	goji.Get("/*", http.FileServer(http.Dir("../public")))
+	//goji.Get("/*", http.FileServer(http.Dir("../public")))
 	goji.Serve()
 }
