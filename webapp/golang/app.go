@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	crand "crypto/rand"
 	"crypto/sha512"
 	"encoding/hex"
@@ -13,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
 	"strconv"
@@ -79,8 +79,16 @@ type Comment struct {
 	User        User
 }
 
+var userCacheMtx sync.Mutex
+var userCache map[string]User
+
+var commentCacheMtx sync.Mutex
+var commentCache map[int][]Comment
+
 func init() {
 	store = sessions.NewCookieStore([]byte("sendagaya"))
+	userCache = map[string]User{}
+	commentCache = map[int][]Comment{}
 }
 
 func imageInitialize() {
@@ -179,24 +187,6 @@ func validateUser(accountName, password string) bool {
 	return regexpName.MatchString(accountName) && regexpPass.MatchString(password)
 }
 
-// 今回のGo実装では言語側のエスケープの仕組みが使えないのでOSコマンドインジェクション対策できない
-// 取り急ぎPHPのescapeshellarg関数を参考に自前で実装
-// cf: http://jp2.php.net/manual/ja/function.escapeshellarg.php
-func escapeshellarg(arg string) string {
-	return "'" + strings.Replace(arg, "'", "'\\''", -1) + "'"
-}
-
-func digestOld(src string) string {
-	// opensslのバージョンによっては (stdin)= というのがつくので取る
-	out, err := exec.Command("/bin/bash", "-c", `printf "%s" `+escapeshellarg(src)+` | openssl dgst -sha512 | sed 's/^.*= //'`).Output()
-	if err != nil {
-		fmt.Println(err)
-		return ""
-	}
-
-	return strings.TrimSuffix(string(out), "\n")
-}
-
 func digest(src string) string {
 	s := sha512.New()
 	io.WriteString(s, src)
@@ -213,7 +203,6 @@ func calculatePasshash(accountName, password string) string {
 
 func getSession(r *http.Request) *sessions.Session {
 	session, _ := store.Get(r, "isuconp-go.session")
-
 	return session
 }
 
@@ -223,14 +212,24 @@ func getSessionUser(r *http.Request) User {
 	if !ok || uid == nil {
 		return User{}
 	}
+	uids := fmt.Sprint(uid)
 
+	userCacheMtx.Lock()
+	user, ok := userCache[uids]
+	userCacheMtx.Unlock()
+
+	if ok {
+		return user
+	}
 	u := User{}
-
 	err := db.Get(&u, "SELECT * FROM `users` WHERE `id` = ?", uid)
 	if err != nil {
 		return User{}
 	}
 
+	userCacheMtx.Lock()
+	userCache[uids] = u
+	userCacheMtx.Unlock()
 	return u
 }
 
@@ -248,36 +247,34 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts2(results []Post, CSRFToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	for i, p := range results {
+		commentCacheMtx.Lock()
+		coms, ok := commentCache[p.ID]
+		commentCacheMtx.Unlock()
 
-	for _, p := range results {
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` ASC"
-
-		var comments []Comment
-		cerr := db.Select(&comments, query, p.ID)
-		if cerr != nil {
-			return nil, cerr
-		}
-
-		p.CommentCount = len(comments)
-
-		for i := 0; i < len(comments); i++ {
-			comments[i].User.AccountName = comments[i].AccountName
-		}
-
-		p.Comments = comments
-		/*
-			perr := db.Get(&p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-			if perr != nil {
-				return nil, perr
+		if ok {
+			p.Comments = coms
+			p.CommentCount = len(coms)
+		} else {
+			query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` ASC"
+			var comments []Comment
+			cerr := db.Select(&comments, query, p.ID)
+			if cerr != nil {
+				return nil, cerr
 			}
-		*/
+			for i := 0; i < len(comments); i++ {
+				comments[i].User.AccountName = comments[i].AccountName
+			}
+			p.CommentCount = len(comments)
+			p.Comments = comments
+			commentCacheMtx.Lock()
+			commentCache[p.ID] = comments
+			commentCacheMtx.Unlock()
+		}
 		p.CSRFToken = CSRFToken
-
-		posts = append(posts, p)
+		results[i] = p
 	}
-
-	return posts, nil
+	return results, nil
 }
 
 func makePosts(results []Post, CSRFToken string, allComments bool) ([]Post, error) {
@@ -495,50 +492,124 @@ func getLogout(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, "/", http.StatusFound)
 }
 
-var fmap = template.FuncMap{
-	"imageURL": imageURL,
-}
-
-var IndexTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-	getTemplPath("layout.html"),
-	getTemplPath("index.html"),
-	getTemplPath("posts.html"),
-	getTemplPath("post.html")))
-
 var getIndexPostsMtx sync.RWMutex
 var getIndexPosts []Post
+var getIndexPostsContent string
 
 func updateIndexPosts() bool {
-	getIndexPostsMtx.Lock()
-	defer getIndexPostsMtx.Unlock()
-	getIndexPosts = []Post{}
-	err := db.Select(&getIndexPosts, "SELECT posts.id, posts.user_id, posts.body, posts.mime, posts.created_at, posts.account_name FROM `posts` AS posts INNER JOIN `users` ON user_id = users.id WHERE users.del_flg = 0 ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
+	foo := []Post{}
+	err := db.Select(&foo, "SELECT posts.id, posts.user_id, posts.body, posts.mime, posts.created_at, posts.account_name FROM `posts` AS posts INNER JOIN `users` ON user_id = users.id WHERE users.del_flg = 0 ORDER BY `created_at` DESC LIMIT ?", postsPerPage)
 	if err != nil {
 		fmt.Println(err)
 		return false
 	}
+
+	posts, merr := makePosts2(foo, "[[[CSRFTOKEN]]]", false)
+	if merr != nil {
+		fmt.Println(merr)
+		return false
+	}
+
+	var b bytes.Buffer
+	IndexTemplate.Execute(&b, struct {
+		Posts     []Post
+		CSRFToken string
+	}{posts, "[[[CSRFTOKEN]]]"})
+
+	getIndexPostsMtx.Lock()
+	getIndexPosts = foo
+	getIndexPostsContent = b.String()
+	getIndexPostsMtx.Unlock()
+
 	return true
 }
+
+var fmap = template.FuncMap{
+	"imageURL": imageURL,
+}
+
+var IndexTemplate = template.Must(
+	template.New("index.html").Funcs(fmap).ParseFiles(
+		getTemplPath("index.html"),
+		getTemplPath("posts.html"),
+		getTemplPath("post.html")))
+
+var IndexTemplateTop, _ = template.New("index").Parse(`<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Iscogram</title>
+    <link href="/css/style.css" media="screen" rel="stylesheet" type="text/css">
+  </head>
+  <body>
+    <div class="container">
+      <div class="header">
+        <div class="isu-title">
+          <h1><a href="/">Iscogram</a></h1>
+        </div>
+        <div class="isu-header-menu">
+          {{ if eq .Me.ID 0}}
+          <div><a href="/login">ログイン</a></div>
+          {{ else }}
+          <div><a href="/@{{.Me.AccountName}}"><span class="isu-account-name">{{.Me.AccountName}}</span>さん</a></div>
+          {{ if eq .Me.Authority 1 }}
+          <div><a href="/admin/banned">管理者用ページ</a></div>
+          {{ end }}
+          <div><a href="/logout">ログアウト</a></div>
+          {{ end }}
+        </div>
+      </div>
+<div class="isu-submit">
+  <form method="post" action="/" enctype="multipart/form-data">
+    <div class="isu-form">
+      <input type="file" name="file" value="file">
+    </div>
+    <div class="isu-form">
+      <textarea name="body"></textarea>
+    </div>
+    <div class="form-submit">
+      <input type="hidden" name="csrf_token" value="{{.CSRFToken}}">
+      <input type="submit" name="submit" value="submit">
+    </div>
+    {{if .Flash}}
+    <div id="notice-message" class="alert alert-danger">
+      {{.Flash}}
+    </div>
+    {{end}}
+  </form>
+</div>
+`)
+
+var IndexTemplateContTopBottom = []byte(`
+<div id="isu-post-more">
+  <button id="isu-post-more-btn">もっと見る</button>
+  <img class="isu-loading-icon" src="/img/ajax-loader.gif">
+</div>
+    </div>
+    <script src="/js/jquery-2.2.0.js"></script>
+    <script src="/js/jquery.timeago.js"></script>
+    <script src="/js/jquery.timeago.ja.js"></script>
+    <script src="/js/main.js"></script>
+  </body>
+</html>
+`)
 
 func getIndex(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
+	IndexTemplateTop.Execute(w, struct {
+		Me        User
+		Flash     string
+		CSRFToken string
+	}{me, getFlash(w, r, "notice"), getCSRFToken(r)})
+
 	getIndexPostsMtx.RLock()
-	results := getIndexPosts
+	a := strings.Replace(getIndexPostsContent, "[[[CSRFTOKEN]]]", getCSRFToken(r), 30)
 	getIndexPostsMtx.RUnlock()
 
-	posts, merr := makePosts2(results, getCSRFToken(r), false)
-	if merr != nil {
-		fmt.Println(merr)
-		return
-	}
+	w.Write([]byte(a))
 
-	IndexTemplate.Execute(w, struct {
-		Posts     []Post
-		Me        User
-		CSRFToken string
-		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	w.Write(IndexTemplateContTopBottom)
 }
 
 var accountNameTemplate = template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
@@ -718,7 +789,7 @@ func getPostsID(c web.C, w http.ResponseWriter, r *http.Request) {
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {
-	r.ParseMultipartForm(1024)
+	r.ParseMultipartForm(4096)
 
 	me := getSessionUser(r)
 	if !isLogin(me) {
@@ -811,7 +882,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Error saving file: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	go updateIndexPosts()
+	updateIndexPosts()
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 	return
 }
@@ -834,8 +905,41 @@ func postComment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`, `account_name`) VALUES (?,?,?,?)"
-	db.Exec(query, postID, me.ID, r.FormValue("comment"), me.AccountName)
+	var times []time.Time
+	err := db.Select(&times, "SELECT CURRENT_TIMESTAMP();")
+	if err != nil {
+		fmt.Println("err", err.Error())
+		return
+	}
+	cur := times[0]
+
+	query := "INSERT INTO `comments` (`post_id`, `user_id`, `comment`, `account_name`, `created_at`) VALUES (?,?,?,?,?)"
+	result, err := db.Exec(query, postID, me.ID, r.FormValue("comment"), me.AccountName, cur)
+	if err != nil {
+		fmt.Println("err", err.Error())
+		return
+	}
+
+	cid, lerr := result.LastInsertId()
+	if lerr != nil {
+		fmt.Println(lerr.Error())
+		return
+	}
+
+	commentCacheMtx.Lock()
+	comms, ok := commentCache[postID]
+	if ok {
+		comms = append(comms, Comment{
+			ID:          int(cid),
+			PostID:      postID,
+			UserID:      me.ID,
+			AccountName: me.AccountName,
+			Comment:     r.FormValue("comment"),
+			CreatedAt:   cur,
+			User:        me,
+		})
+	}
+	commentCacheMtx.Unlock()
 
 	http.Redirect(w, r, fmt.Sprintf("/posts/%d", postID), http.StatusFound)
 }
@@ -893,6 +997,16 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 		db.Exec(query, 1, id)
 	}
 
+	for _, id := range r.Form["uid[]"] {
+		userCacheMtx.Lock()
+		u, ok := userCache[fmt.Sprint(id)]
+		if ok {
+			u.DelFlg = 1
+			userCache[fmt.Sprint(id)] = u
+		}
+		userCacheMtx.Unlock()
+	}
+
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
 }
 
@@ -945,6 +1059,10 @@ func main() {
 		}
 		return
 	}
+
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
 	goji.Get("/initialize", getInitialize)
 	goji.Get("/login", getLogin)
