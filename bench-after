@@ -1,0 +1,23 @@
+#!/bin/bash
+BENCH_DIR="bench-latest"
+curl http://localhost:6060/endprof
+kill $(cat dstat.pid)
+./report > $BENCH_DIR/summary.txt
+go tool pprof -svg webapp/golang/app /tmp/cpu.pprof > $BENCH_DIR/cpu.svg
+go tool pprof -svg webapp/golang/app /tmp/mem.pprof > $BENCH_DIR/mem.svg
+go tool pprof -svg webapp/golang/app /tmp/block.pprof > $BENCH_DIR/block.svg
+go tool pprof -text webapp/golang/app /tmp/cpu.pprof > $BENCH_DIR/cpu.txt
+go tool pprof -text webapp/golang/app /tmp/mem.pprof > $BENCH_DIR/mem.txt
+go tool pprof -text webapp/golang/app /tmp/block.pprof > $BENCH_DIR/block.txt
+go tool pprof -text -cum webapp/golang/app /tmp/cpu.pprof > $BENCH_DIR/cpu-cum.txt
+go tool pprof -text -cum webapp/golang/app /tmp/mem.pprof > $BENCH_DIR/mem-cum.txt
+go tool pprof -text -cum webapp/golang/app /tmp/block.pprof > $BENCH_DIR/block-cum.txt
+go tool pprof -list=main. webapp/golang/app /tmp/cpu.pprof > $BENCH_DIR/cpu.list
+go tool pprof -list=main. webapp/golang/app /tmp/mem.pprof > $BENCH_DIR/mem.list
+go tool pprof -list=main. webapp/golang/app /tmp/block.pprof > $BENCH_DIR/block.list
+go-torch webapp/golang/app /tmp/cpu.pprof --file=$BENCH_DIR/cpu-torch.svg
+go-torch webapp/golang/app /tmp/mem.pprof --file=$BENCH_DIR/mem-torch.svg
+go-torch webapp/golang/app /tmp/block.pprof --file=$BENCH_DIR/block-torch.svg
+
+sudo mysqldumpslow -t 10 -s t /var/log/mysql/mysql-slow.log > $BENCH_DIR/mysql.txt
+python make_report.py $BENCH_DIR > $BENCH_DIR/index.html

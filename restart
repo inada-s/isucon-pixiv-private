@@ -1,5 +1,19 @@
+#!/bin/bash
+cd $(dirname $0)
+rm /tmp/cpu.pprof 
+rm /tmp/mem.pprof
+rm /tmp/block.pprof
+
+sudo truncate -s0 /var/log/nginx/access.log 
+sudo truncate -s0 /var/log/mysql/mysql-slow.log
+
 sudo systemctl daemon-reload
-sudo rm /var/log/nginx/access.log 
 sudo systemctl restart mysql
 sudo systemctl restart nginx
 sudo systemctl restart isu-go
+
+mysql -u root -e 'set global slow_query_log_file = "/var/log/mysql/mysql-slow.log";'
+mysql -u root -e 'set global long_query_time = 0.5;'
+mysql -u root -e 'set global slow_query_log = ON;'
+#mysql -u root -e 'set global slow_query_log = OFF;'
+
